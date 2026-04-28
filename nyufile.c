@@ -58,12 +58,69 @@ typedef struct __attribute__((packed)) {
     uint8_t  BS_FilSysType[8];
 } BootSector;
 
-static void print_usage(const char *prog_name) {
-    printf("Usage: %s disk <options>\n", prog_name);
-    printf("  -i                     Print the file system information.\n");
-    printf("  -l                     List the root directory.\n");
-    printf("  -r filename [-s sha1]  Recover a contiguous file.\n");
-    printf("  -R filename -s sha1    Recover a possibly non-contiguous file.\n");
+typedef struct {
+    int      fd;
+    size_t   size;
+    uint8_t *bytes;
+    int      writable;
+
+    uint32_t bytes_per_sector;
+    uint32_t sectors_per_cluster;
+    uint32_t reserved_sectors;
+    uint32_t num_fats;
+    uint32_t fat_size_sectors;
+    uint32_t root_cluster;
+
+    uint32_t fat_offset;
+    uint32_t data_offset;
+    uint32_t bytes_per_cluster;
+    uint32_t entries_per_cluster;
+} Disk;
+
+static Disk disk_open(const char *path, int writable) {
+    Disk d;
+    d.fd = open(path, writable ? O_RDWR : O_RDONLY);
+
+    struct stat st;
+    fstat(d.fd, &st);
+    d.size     = st.st_size;
+    d.writable = writable;
+
+    int prot  = PROT_READ | (writable ? PROT_WRITE : 0);
+    int flags = writable ? MAP_SHARED : MAP_PRIVATE;
+    d.bytes = mmap(NULL, d.size, prot, flags, d.fd, 0);
+
+    BootSector *boot = (BootSector *)d.bytes;
+    d.bytes_per_sector    = boot->BPB_BytsPerSec;
+    d.sectors_per_cluster = boot->BPB_SecPerClus;
+    d.reserved_sectors    = boot->BPB_RsvdSecCnt;
+    d.num_fats            = boot->BPB_NumFATs;
+    d.fat_size_sectors    = boot->BPB_FATSz32;
+    d.root_cluster        = boot->BPB_RootClus;
+
+    d.fat_offset          = d.reserved_sectors * d.bytes_per_sector;
+    d.data_offset         = (d.reserved_sectors + d.num_fats * d.fat_size_sectors)
+                            * d.bytes_per_sector;
+    d.bytes_per_cluster   = d.sectors_per_cluster * d.bytes_per_sector;
+    d.entries_per_cluster = d.bytes_per_cluster / sizeof(DirEntry);
+
+    return d;
+}
+
+static void disk_close(Disk *d) {
+    if (d->writable) msync(d->bytes, d->size, MS_SYNC);
+    munmap(d->bytes, d->size);
+    close(d->fd);
+}
+
+static uint32_t *fat_table(const Disk *d, uint32_t which) {
+    return (uint32_t *)(d->bytes
+        + (d->reserved_sectors + which * d->fat_size_sectors)
+        * d->bytes_per_sector);
+}
+
+static uint8_t *cluster_data(const Disk *d, uint32_t cluster) {
+    return d->bytes + d->data_offset + (cluster - 2) * d->bytes_per_cluster;
 }
 
 static void name_to_short(const char *name, uint8_t out[11]) {
@@ -98,38 +155,79 @@ static void format_short_name(const uint8_t raw[11], int is_dir, char *out) {
     out[p] = '\0';
 }
 
-static void list_root_dir(const char *image_path) {
-    int image_fd = open(image_path, O_RDONLY);
-    struct stat image_stat;
-    fstat(image_fd, &image_stat);
-    uint8_t *disk = mmap(NULL, image_stat.st_size,
-                         PROT_READ, MAP_PRIVATE, image_fd, 0);
+static int names_match_after_first(const uint8_t a[11], const uint8_t b[11]) {
+    for (int k = 1; k < 11; k++) {
+        if (a[k] != b[k]) return 0;
+    }
+    return 1;
+}
 
-    BootSector *boot = (BootSector *)disk;
-    uint32_t bytes_per_sector    = boot->BPB_BytsPerSec;
-    uint32_t sectors_per_cluster = boot->BPB_SecPerClus;
-    uint32_t reserved_sectors    = boot->BPB_RsvdSecCnt;
-    uint32_t num_fats            = boot->BPB_NumFATs;
-    uint32_t fat_size_sectors    = boot->BPB_FATSz32;
-    uint32_t root_cluster        = boot->BPB_RootClus;
-
-    uint32_t fat_offset    = reserved_sectors * bytes_per_sector;
-    uint32_t data_offset   = (reserved_sectors + num_fats * fat_size_sectors)
-                             * bytes_per_sector;
-    uint32_t bytes_per_clus = sectors_per_cluster * bytes_per_sector;
-    uint32_t entries_per_clus = bytes_per_clus / sizeof(DirEntry);
-    uint32_t *fat = (uint32_t *)(disk + fat_offset);
-
-    uint32_t cluster = root_cluster;
-    int      entry_count = 0;
-    int      end_marker_seen = 0;
+static DirEntry *find_deleted_match(const Disk *d, const uint8_t target_short[11]) {
+    uint32_t *fat = fat_table(d, 0);
+    uint32_t  cluster = d->root_cluster;
+    int       end_marker_seen = 0;
 
     while (!end_marker_seen && cluster < FAT_EOC_THRESHOLD) {
-        uint8_t *cluster_bytes = disk + data_offset
-                                 + (cluster - 2) * bytes_per_clus;
+        DirEntry *entries = (DirEntry *)cluster_data(d, cluster);
 
-        for (uint32_t i = 0; i < entries_per_clus; i++) {
-            DirEntry *e = (DirEntry *)(cluster_bytes + i * sizeof(DirEntry));
+        for (uint32_t i = 0; i < d->entries_per_cluster; i++) {
+            DirEntry *e = &entries[i];
+
+            if (e->DIR_Name[0] == DIR_ENTRY_END)     { end_marker_seen = 1; break; }
+            if (e->DIR_Name[0] != DIR_ENTRY_DELETED)  continue;
+            if ((e->DIR_Attr & ATTR_LONG_NAME) == ATTR_LONG_NAME) continue;
+            if (e->DIR_Attr & ATTR_DIRECTORY)         continue;
+            if (e->DIR_Attr & ATTR_VOLUME_ID)         continue;
+
+            if (names_match_after_first(e->DIR_Name, target_short)) return e;
+        }
+
+        cluster = fat[cluster] & FAT_ENTRY_MASK;
+    }
+    return NULL;
+}
+
+static void write_contiguous_chain(const Disk *d, uint32_t start, uint32_t fsize) {
+    uint32_t num_clusters = (fsize + d->bytes_per_cluster - 1) / d->bytes_per_cluster;
+    for (uint32_t f = 0; f < d->num_fats; f++) {
+        uint32_t *fat_f = fat_table(d, f);
+        for (uint32_t i = 0; i < num_clusters; i++) {
+            fat_f[start + i] = (i + 1 == num_clusters)
+                               ? FAT_ENTRY_MASK
+                               : start + i + 1;
+        }
+    }
+}
+
+static void print_usage(const char *prog_name) {
+    printf("Usage: %s disk <options>\n", prog_name);
+    printf("  -i                     Print the file system information.\n");
+    printf("  -l                     List the root directory.\n");
+    printf("  -r filename [-s sha1]  Recover a contiguous file.\n");
+    printf("  -R filename -s sha1    Recover a possibly non-contiguous file.\n");
+}
+
+static void print_fs_info(const char *image_path) {
+    Disk d = disk_open(image_path, 0);
+    printf("Number of FATs = %u\n",                d.num_fats);
+    printf("Number of bytes per sector = %u\n",    d.bytes_per_sector);
+    printf("Number of sectors per cluster = %u\n", d.sectors_per_cluster);
+    printf("Number of reserved sectors = %u\n",    d.reserved_sectors);
+    disk_close(&d);
+}
+
+static void list_root_dir(const char *image_path) {
+    Disk d = disk_open(image_path, 0);
+    uint32_t *fat = fat_table(&d, 0);
+    uint32_t  cluster = d.root_cluster;
+    int       entry_count = 0;
+    int       end_marker_seen = 0;
+
+    while (!end_marker_seen && cluster < FAT_EOC_THRESHOLD) {
+        DirEntry *entries = (DirEntry *)cluster_data(&d, cluster);
+
+        for (uint32_t i = 0; i < d.entries_per_cluster; i++) {
+            DirEntry *e = &entries[i];
 
             if (e->DIR_Name[0] == DIR_ENTRY_END)     { end_marker_seen = 1; break; }
             if (e->DIR_Name[0] == DIR_ENTRY_DELETED)  continue;
@@ -159,103 +257,28 @@ static void list_root_dir(const char *image_path) {
     }
 
     printf("Total number of entries = %d\n", entry_count);
-
-    munmap(disk, image_stat.st_size);
-    close(image_fd);
+    disk_close(&d);
 }
 
-static void recover_small_file(const char *image_path, const char *target_name) {
-    int image_fd = open(image_path, O_RDWR);
-    struct stat image_stat;
-    fstat(image_fd, &image_stat);
-    uint8_t *disk = mmap(NULL, image_stat.st_size,
-                         PROT_READ | PROT_WRITE, MAP_SHARED, image_fd, 0);
-
-    BootSector *boot = (BootSector *)disk;
-    uint32_t bytes_per_sector    = boot->BPB_BytsPerSec;
-    uint32_t sectors_per_cluster = boot->BPB_SecPerClus;
-    uint32_t reserved_sectors    = boot->BPB_RsvdSecCnt;
-    uint32_t num_fats            = boot->BPB_NumFATs;
-    uint32_t fat_size_sectors    = boot->BPB_FATSz32;
-    uint32_t root_cluster        = boot->BPB_RootClus;
-
-    uint32_t fat_offset    = reserved_sectors * bytes_per_sector;
-    uint32_t data_offset   = (reserved_sectors + num_fats * fat_size_sectors)
-                             * bytes_per_sector;
-    uint32_t bytes_per_clus = sectors_per_cluster * bytes_per_sector;
-    uint32_t entries_per_clus = bytes_per_clus / sizeof(DirEntry);
-    uint32_t *fat0 = (uint32_t *)(disk + fat_offset);
+static void recover_contiguous_file(const char *image_path, const char *target_name) {
+    Disk d = disk_open(image_path, 1);
 
     uint8_t target_short[11];
     name_to_short(target_name, target_short);
 
-    DirEntry *match = NULL;
-    uint32_t  cluster = root_cluster;
-    int       end_marker_seen = 0;
-
-    while (!match && !end_marker_seen && cluster < FAT_EOC_THRESHOLD) {
-        uint8_t *cluster_bytes = disk + data_offset
-                                 + (cluster - 2) * bytes_per_clus;
-
-        for (uint32_t i = 0; i < entries_per_clus; i++) {
-            DirEntry *e = (DirEntry *)(cluster_bytes + i * sizeof(DirEntry));
-
-            if (e->DIR_Name[0] == DIR_ENTRY_END)     { end_marker_seen = 1; break; }
-            if (e->DIR_Name[0] != DIR_ENTRY_DELETED)  continue;
-            if ((e->DIR_Attr & ATTR_LONG_NAME) == ATTR_LONG_NAME) continue;
-            if (e->DIR_Attr & ATTR_DIRECTORY)         continue;
-            if (e->DIR_Attr & ATTR_VOLUME_ID)         continue;
-
-            int ok = 1;
-            for (int k = 1; k < 11; k++) {
-                if (e->DIR_Name[k] != target_short[k]) { ok = 0; break; }
-            }
-            if (ok) { match = e; break; }
-        }
-
-        cluster = fat0[cluster] & FAT_ENTRY_MASK;
-    }
-
+    DirEntry *match = find_deleted_match(&d, target_short);
     if (!match) {
         printf("%s: file not found\n", target_name);
-        munmap(disk, image_stat.st_size);
-        close(image_fd);
+        disk_close(&d);
         return;
     }
 
     match->DIR_Name[0] = target_short[0];
-
     uint32_t start = ((uint32_t)match->DIR_FstClusHI << 16) | match->DIR_FstClusLO;
-    if (match->DIR_FileSize > 0) {
-        for (uint32_t f = 0; f < num_fats; f++) {
-            uint32_t *fat_f = (uint32_t *)(disk
-                              + (reserved_sectors + f * fat_size_sectors)
-                              * bytes_per_sector);
-            fat_f[start] = FAT_ENTRY_MASK;
-        }
-    }
+    write_contiguous_chain(&d, start, match->DIR_FileSize);
 
-    msync(disk, image_stat.st_size, MS_SYNC);
-    munmap(disk, image_stat.st_size);
-    close(image_fd);
-
+    disk_close(&d);
     printf("%s: successfully recovered\n", target_name);
-}
-
-static void print_fs_info(const char *image_path) {
-    int image_fd = open(image_path, O_RDONLY);
-    struct stat image_stat;
-    fstat(image_fd, &image_stat);
-    BootSector *boot = mmap(NULL, image_stat.st_size,
-                            PROT_READ, MAP_PRIVATE, image_fd, 0);
-
-    printf("Number of FATs = %u\n",                boot->BPB_NumFATs);
-    printf("Number of bytes per sector = %u\n",    boot->BPB_BytsPerSec);
-    printf("Number of sectors per cluster = %u\n", boot->BPB_SecPerClus);
-    printf("Number of reserved sectors = %u\n",    boot->BPB_RsvdSecCnt);
-
-    munmap(boot, image_stat.st_size);
-    close(image_fd);
 }
 
 int main(int argc, char *argv[]) {
@@ -318,7 +341,7 @@ int main(int argc, char *argv[]) {
     } else if (list_flag) {
         list_root_dir(argv[1]);
     } else if (recover_arg) {
-        recover_small_file(argv[1], recover_arg);
+        recover_contiguous_file(argv[1], recover_arg);
     }
 
     return 0;
