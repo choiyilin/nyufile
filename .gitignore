@@ -1,0 +1,9 @@
+fat32.disk
+*.disk
+*.img
+
+*.o
+*.d
+nyufile
+
+.DS_Store
