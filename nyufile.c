@@ -162,7 +162,11 @@ static int names_match_after_first(const uint8_t a[11], const uint8_t b[11]) {
     return 1;
 }
 
-static DirEntry *find_deleted_match(const Disk *d, const uint8_t target_short[11]) {
+static int find_deleted_matches(const Disk *d, const uint8_t target_short[11],
+                                DirEntry **out_first) {
+    *out_first = NULL;
+    int match_count = 0;
+
     uint32_t *fat = fat_table(d, 0);
     uint32_t  cluster = d->root_cluster;
     int       end_marker_seen = 0;
@@ -179,12 +183,15 @@ static DirEntry *find_deleted_match(const Disk *d, const uint8_t target_short[11
             if (e->DIR_Attr & ATTR_DIRECTORY)         continue;
             if (e->DIR_Attr & ATTR_VOLUME_ID)         continue;
 
-            if (names_match_after_first(e->DIR_Name, target_short)) return e;
+            if (names_match_after_first(e->DIR_Name, target_short)) {
+                if (match_count == 0) *out_first = e;
+                match_count++;
+            }
         }
 
         cluster = fat[cluster] & FAT_ENTRY_MASK;
     }
-    return NULL;
+    return match_count;
 }
 
 static void write_contiguous_chain(const Disk *d, uint32_t start, uint32_t fsize) {
@@ -266,9 +273,16 @@ static void recover_contiguous_file(const char *image_path, const char *target_n
     uint8_t target_short[11];
     name_to_short(target_name, target_short);
 
-    DirEntry *match = find_deleted_match(&d, target_short);
-    if (!match) {
+    DirEntry *match = NULL;
+    int match_count = find_deleted_matches(&d, target_short, &match);
+
+    if (match_count == 0) {
         printf("%s: file not found\n", target_name);
+        disk_close(&d);
+        return;
+    }
+    if (match_count > 1) {
+        printf("%s: multiple candidates found\n", target_name);
         disk_close(&d);
         return;
     }
