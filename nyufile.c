@@ -1,9 +1,13 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <openssl/sha.h>
+
+#define SHA1_BYTES SHA_DIGEST_LENGTH
 
 #define ATTR_VOLUME_ID    0x08
 #define ATTR_DIRECTORY    0x10
@@ -155,6 +159,35 @@ static void format_short_name(const uint8_t raw[11], int is_dir, char *out) {
     out[p] = '\0';
 }
 
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int parse_sha1_hex(const char *hex, uint8_t out[SHA1_BYTES]) {
+    for (int i = 0; i < SHA1_BYTES; i++) {
+        int hi = hex_nibble(hex[2 * i]);
+        int lo = hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return 0;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return hex[2 * SHA1_BYTES] == '\0';
+}
+
+static void compute_entry_sha1(const Disk *d, const DirEntry *e,
+                               uint8_t out[SHA1_BYTES]) {
+    uint32_t fsize = e->DIR_FileSize;
+    if (fsize == 0) {
+        SHA1((const unsigned char *)"", 0, out);
+        return;
+    }
+    uint32_t start = ((uint32_t)e->DIR_FstClusHI << 16) | e->DIR_FstClusLO;
+    uint8_t *data = cluster_data(d, start);
+    SHA1(data, fsize, out);
+}
+
 static int names_match_after_first(const uint8_t a[11], const uint8_t b[11]) {
     for (int k = 1; k < 11; k++) {
         if (a[k] != b[k]) return 0;
@@ -162,7 +195,9 @@ static int names_match_after_first(const uint8_t a[11], const uint8_t b[11]) {
     return 1;
 }
 
-static int find_deleted_matches(const Disk *d, const uint8_t target_short[11],
+static int find_deleted_matches(const Disk *d,
+                                const uint8_t target_short[11],
+                                const uint8_t *target_sha1,
                                 DirEntry **out_first) {
     *out_first = NULL;
     int match_count = 0;
@@ -183,10 +218,16 @@ static int find_deleted_matches(const Disk *d, const uint8_t target_short[11],
             if (e->DIR_Attr & ATTR_DIRECTORY)         continue;
             if (e->DIR_Attr & ATTR_VOLUME_ID)         continue;
 
-            if (names_match_after_first(e->DIR_Name, target_short)) {
-                if (match_count == 0) *out_first = e;
-                match_count++;
+            if (!names_match_after_first(e->DIR_Name, target_short)) continue;
+
+            if (target_sha1) {
+                uint8_t entry_sha1[SHA1_BYTES];
+                compute_entry_sha1(d, e, entry_sha1);
+                if (memcmp(entry_sha1, target_sha1, SHA1_BYTES) != 0) continue;
             }
+
+            if (match_count == 0) *out_first = e;
+            match_count++;
         }
 
         cluster = fat[cluster] & FAT_ENTRY_MASK;
@@ -267,21 +308,29 @@ static void list_root_dir(const char *image_path) {
     disk_close(&d);
 }
 
-static void recover_contiguous_file(const char *image_path, const char *target_name) {
+static void recover_contiguous_file(const char *image_path,
+                                    const char *target_name,
+                                    const char *sha1_hex) {
     Disk d = disk_open(image_path, 1);
 
     uint8_t target_short[11];
     name_to_short(target_name, target_short);
 
+    uint8_t  target_sha1[SHA1_BYTES];
+    uint8_t *sha1_filter = NULL;
+    if (sha1_hex && parse_sha1_hex(sha1_hex, target_sha1)) {
+        sha1_filter = target_sha1;
+    }
+
     DirEntry *match = NULL;
-    int match_count = find_deleted_matches(&d, target_short, &match);
+    int match_count = find_deleted_matches(&d, target_short, sha1_filter, &match);
 
     if (match_count == 0) {
         printf("%s: file not found\n", target_name);
         disk_close(&d);
         return;
     }
-    if (match_count > 1) {
+    if (!sha1_filter && match_count > 1) {
         printf("%s: multiple candidates found\n", target_name);
         disk_close(&d);
         return;
@@ -292,7 +341,12 @@ static void recover_contiguous_file(const char *image_path, const char *target_n
     write_contiguous_chain(&d, start, match->DIR_FileSize);
 
     disk_close(&d);
-    printf("%s: successfully recovered\n", target_name);
+
+    if (sha1_filter) {
+        printf("%s: successfully recovered with SHA-1\n", target_name);
+    } else {
+        printf("%s: successfully recovered\n", target_name);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -355,7 +409,7 @@ int main(int argc, char *argv[]) {
     } else if (list_flag) {
         list_root_dir(argv[1]);
     } else if (recover_arg) {
-        recover_contiguous_file(argv[1], recover_arg);
+        recover_contiguous_file(argv[1], recover_arg, sha1_arg);
     }
 
     return 0;
