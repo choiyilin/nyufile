@@ -1,416 +1,443 @@
+/* nyufile -- FAT32 file recovery */
+
 #include <stdio.h>
-#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <openssl/sha.h>
 
-#define SHA1_BYTES SHA_DIGEST_LENGTH
+#pragma pack(push,1)
+typedef struct BootEntry {
+    unsigned char  BS_jmpBoot[3];
+    unsigned char  BS_OEMName[8];
+    unsigned short BPB_BytsPerSec;
+    unsigned char  BPB_SecPerClus;
+    unsigned short BPB_RsvdSecCnt;
+    unsigned char  BPB_NumFATs;
+    unsigned short BPB_RootEntCnt;
+    unsigned short BPB_TotSec16;
+    unsigned char  BPB_Media;
+    unsigned short BPB_FATSz16;
+    unsigned short BPB_SecPerTrk;
+    unsigned short BPB_NumHeads;
+    unsigned int   BPB_HiddSec;
+    unsigned int   BPB_TotSec32;
+    unsigned int   BPB_FATSz32;
+    unsigned short BPB_ExtFlags;
+    unsigned short BPB_FSVer;
+    unsigned int   BPB_RootClus;
+    unsigned short BPB_FSInfo;
+    unsigned short BPB_BkBootSec;
+    unsigned char  BPB_Reserved[12];
+    unsigned char  BS_DrvNum;
+    unsigned char  BS_Reserved1;
+    unsigned char  BS_BootSig;
+    unsigned int   BS_VolID;
+    unsigned char  BS_VolLab[11];
+    unsigned char  BS_FilSysType[8];
+} BootEntry;
 
-#define ATTR_VOLUME_ID    0x08
-#define ATTR_DIRECTORY    0x10
-#define ATTR_LONG_NAME    0x0F
-#define DIR_ENTRY_END     0x00
-#define DIR_ENTRY_DELETED 0xE5
-#define FAT_EOC_THRESHOLD 0x0FFFFFF8
-#define FAT_ENTRY_MASK    0x0FFFFFFF
-
-typedef struct __attribute__((packed)) {
-    uint8_t  DIR_Name[11];
-    uint8_t  DIR_Attr;
-    uint8_t  DIR_NTRes;
-    uint8_t  DIR_CrtTimeTenth;
-    uint16_t DIR_CrtTime;
-    uint16_t DIR_CrtDate;
-    uint16_t DIR_LstAccDate;
-    uint16_t DIR_FstClusHI;
-    uint16_t DIR_WrtTime;
-    uint16_t DIR_WrtDate;
-    uint16_t DIR_FstClusLO;
-    uint32_t DIR_FileSize;
+typedef struct DirEntry {
+    unsigned char  DIR_Name[11];
+    unsigned char  DIR_Attr;
+    unsigned char  DIR_NTRes;
+    unsigned char  DIR_CrtTimeTenth;
+    unsigned short DIR_CrtTime;
+    unsigned short DIR_CrtDate;
+    unsigned short DIR_LstAccDate;
+    unsigned short DIR_FstClusHI;
+    unsigned short DIR_WrtTime;
+    unsigned short DIR_WrtDate;
+    unsigned short DIR_FstClusLO;
+    unsigned int   DIR_FileSize;
 } DirEntry;
+#pragma pack(pop)
 
-typedef struct __attribute__((packed)) {
-    uint8_t  BS_jmpBoot[3];
-    uint8_t  BS_OEMName[8];
-    uint16_t BPB_BytsPerSec;
-    uint8_t  BPB_SecPerClus;
-    uint16_t BPB_RsvdSecCnt;
-    uint8_t  BPB_NumFATs;
-    uint16_t BPB_RootEntCnt;
-    uint16_t BPB_TotSec16;
-    uint8_t  BPB_Media;
-    uint16_t BPB_FATSz16;
-    uint16_t BPB_SecPerTrk;
-    uint16_t BPB_NumHeads;
-    uint32_t BPB_HiddSec;
-    uint32_t BPB_TotSec32;
-    uint32_t BPB_FATSz32;
-    uint16_t BPB_ExtFlags;
-    uint16_t BPB_FSVer;
-    uint32_t BPB_RootClus;
-    uint16_t BPB_FSInfo;
-    uint16_t BPB_BkBootSec;
-    uint8_t  BPB_Reserved[12];
-    uint8_t  BS_DrvNum;
-    uint8_t  BS_Reserved1;
-    uint8_t  BS_BootSig;
-    uint32_t BS_VolID;
-    uint8_t  BS_VolLab[11];
-    uint8_t  BS_FilSysType[8];
-} BootSector;
+#define EOC      0x0FFFFFF8u
+#define FATMASK  0x0FFFFFFFu
 
-typedef struct {
-    int      fd;
-    size_t   size;
-    uint8_t *bytes;
-    int      writable;
+#define MAX_POOL  20
+#define MAX_CHAIN 5
 
-    uint32_t bytes_per_sector;
-    uint32_t sectors_per_cluster;
-    uint32_t reserved_sectors;
-    uint32_t num_fats;
-    uint32_t fat_size_sectors;
-    uint32_t root_cluster;
+struct fs {
+    int            fd;
+    size_t         len;
+    unsigned char *raw;
+    BootEntry     *bs;
+    unsigned       cs;       /* cluster size in bytes */
+    unsigned       data_off; /* byte offset of cluster 2 */
+};
 
-    uint32_t fat_offset;
-    uint32_t data_offset;
-    uint32_t bytes_per_cluster;
-    uint32_t entries_per_cluster;
-} Disk;
-
-static Disk disk_open(const char *path, int writable) {
-    Disk d;
-    d.fd = open(path, writable ? O_RDWR : O_RDONLY);
-
-    struct stat st;
-    fstat(d.fd, &st);
-    d.size     = st.st_size;
-    d.writable = writable;
-
-    int prot  = PROT_READ | (writable ? PROT_WRITE : 0);
-    int flags = writable ? MAP_SHARED : MAP_PRIVATE;
-    d.bytes = mmap(NULL, d.size, prot, flags, d.fd, 0);
-
-    BootSector *boot = (BootSector *)d.bytes;
-    d.bytes_per_sector    = boot->BPB_BytsPerSec;
-    d.sectors_per_cluster = boot->BPB_SecPerClus;
-    d.reserved_sectors    = boot->BPB_RsvdSecCnt;
-    d.num_fats            = boot->BPB_NumFATs;
-    d.fat_size_sectors    = boot->BPB_FATSz32;
-    d.root_cluster        = boot->BPB_RootClus;
-
-    d.fat_offset          = d.reserved_sectors * d.bytes_per_sector;
-    d.data_offset         = (d.reserved_sectors + d.num_fats * d.fat_size_sectors)
-                            * d.bytes_per_sector;
-    d.bytes_per_cluster   = d.sectors_per_cluster * d.bytes_per_sector;
-    d.entries_per_cluster = d.bytes_per_cluster / sizeof(DirEntry);
-
-    return d;
-}
-
-static void disk_close(Disk *d) {
-    if (d->writable) msync(d->bytes, d->size, MS_SYNC);
-    munmap(d->bytes, d->size);
-    close(d->fd);
-}
-
-static uint32_t *fat_table(const Disk *d, uint32_t which) {
-    return (uint32_t *)(d->bytes
-        + (d->reserved_sectors + which * d->fat_size_sectors)
-        * d->bytes_per_sector);
-}
-
-static uint8_t *cluster_data(const Disk *d, uint32_t cluster) {
-    return d->bytes + d->data_offset + (cluster - 2) * d->bytes_per_cluster;
-}
-
-static void name_to_short(const char *name, uint8_t out[11]) {
-    for (int k = 0; k < 11; k++) out[k] = ' ';
-    int i = 0, j = 0;
-    while (name[i] != '\0' && name[i] != '.' && j < 8) {
-        out[j++] = (uint8_t)name[i++];
-    }
-    if (name[i] == '.') {
-        i++;
-        j = 8;
-        while (name[i] != '\0' && j < 11) {
-            out[j++] = (uint8_t)name[i++];
-        }
-    }
-}
-
-static void format_short_name(const uint8_t raw[11], int is_dir, char *out) {
-    int p = 0;
-    int base_end = 8;
-    while (base_end > 0 && raw[base_end - 1] == ' ') base_end--;
-    for (int j = 0; j < base_end; j++) out[p++] = raw[j];
-
-    int ext_end = 11;
-    while (ext_end > 8 && raw[ext_end - 1] == ' ') ext_end--;
-    if (ext_end > 8) {
-        out[p++] = '.';
-        for (int j = 8; j < ext_end; j++) out[p++] = raw[j];
-    }
-
-    if (is_dir) out[p++] = '/';
-    out[p] = '\0';
-}
-
-static int hex_nibble(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static int parse_sha1_hex(const char *hex, uint8_t out[SHA1_BYTES]) {
-    for (int i = 0; i < SHA1_BYTES; i++) {
-        int hi = hex_nibble(hex[2 * i]);
-        int lo = hex_nibble(hex[2 * i + 1]);
-        if (hi < 0 || lo < 0) return 0;
-        out[i] = (uint8_t)((hi << 4) | lo);
-    }
-    return hex[2 * SHA1_BYTES] == '\0';
-}
-
-static void compute_entry_sha1(const Disk *d, const DirEntry *e,
-                               uint8_t out[SHA1_BYTES]) {
-    uint32_t fsize = e->DIR_FileSize;
-    if (fsize == 0) {
-        SHA1((const unsigned char *)"", 0, out);
-        return;
-    }
-    uint32_t start = ((uint32_t)e->DIR_FstClusHI << 16) | e->DIR_FstClusLO;
-    uint8_t *data = cluster_data(d, start);
-    SHA1(data, fsize, out);
-}
-
-static int names_match_after_first(const uint8_t a[11], const uint8_t b[11]) {
-    for (int k = 1; k < 11; k++) {
-        if (a[k] != b[k]) return 0;
-    }
-    return 1;
-}
-
-static int find_deleted_matches(const Disk *d,
-                                const uint8_t target_short[11],
-                                const uint8_t *target_sha1,
-                                DirEntry **out_first) {
-    *out_first = NULL;
-    int match_count = 0;
-
-    uint32_t *fat = fat_table(d, 0);
-    uint32_t  cluster = d->root_cluster;
-    int       end_marker_seen = 0;
-
-    while (!end_marker_seen && cluster < FAT_EOC_THRESHOLD) {
-        DirEntry *entries = (DirEntry *)cluster_data(d, cluster);
-
-        for (uint32_t i = 0; i < d->entries_per_cluster; i++) {
-            DirEntry *e = &entries[i];
-
-            if (e->DIR_Name[0] == DIR_ENTRY_END)     { end_marker_seen = 1; break; }
-            if (e->DIR_Name[0] != DIR_ENTRY_DELETED)  continue;
-            if ((e->DIR_Attr & ATTR_LONG_NAME) == ATTR_LONG_NAME) continue;
-            if (e->DIR_Attr & ATTR_DIRECTORY)         continue;
-            if (e->DIR_Attr & ATTR_VOLUME_ID)         continue;
-
-            if (!names_match_after_first(e->DIR_Name, target_short)) continue;
-
-            if (target_sha1) {
-                uint8_t entry_sha1[SHA1_BYTES];
-                compute_entry_sha1(d, e, entry_sha1);
-                if (memcmp(entry_sha1, target_sha1, SHA1_BYTES) != 0) continue;
-            }
-
-            if (match_count == 0) *out_first = e;
-            match_count++;
-        }
-
-        cluster = fat[cluster] & FAT_ENTRY_MASK;
-    }
-    return match_count;
-}
-
-static void write_contiguous_chain(const Disk *d, uint32_t start, uint32_t fsize) {
-    uint32_t num_clusters = (fsize + d->bytes_per_cluster - 1) / d->bytes_per_cluster;
-    for (uint32_t f = 0; f < d->num_fats; f++) {
-        uint32_t *fat_f = fat_table(d, f);
-        for (uint32_t i = 0; i < num_clusters; i++) {
-            fat_f[start + i] = (i + 1 == num_clusters)
-                               ? FAT_ENTRY_MASK
-                               : start + i + 1;
-        }
-    }
-}
-
-static void print_usage(const char *prog_name) {
-    printf("Usage: %s disk <options>\n", prog_name);
+static void usage(const char *p) {
+    printf("Usage: %s disk <options>\n", p);
     printf("  -i                     Print the file system information.\n");
     printf("  -l                     List the root directory.\n");
     printf("  -r filename [-s sha1]  Recover a contiguous file.\n");
     printf("  -R filename -s sha1    Recover a possibly non-contiguous file.\n");
 }
 
-static void print_fs_info(const char *image_path) {
-    Disk d = disk_open(image_path, 0);
-    printf("Number of FATs = %u\n",                d.num_fats);
-    printf("Number of bytes per sector = %u\n",    d.bytes_per_sector);
-    printf("Number of sectors per cluster = %u\n", d.sectors_per_cluster);
-    printf("Number of reserved sectors = %u\n",    d.reserved_sectors);
-    disk_close(&d);
+static void open_fs(const char *path, int rw, struct fs *m) {
+    struct stat st;
+    m->fd  = open(path, rw ? O_RDWR : O_RDONLY);
+    fstat(m->fd, &st);
+    m->len = st.st_size;
+    m->raw = mmap(NULL, m->len,
+                  rw ? PROT_READ|PROT_WRITE : PROT_READ,
+                  rw ? MAP_SHARED : MAP_PRIVATE, m->fd, 0);
+    m->bs       = (BootEntry *)m->raw;
+    m->cs       = (unsigned)m->bs->BPB_BytsPerSec * m->bs->BPB_SecPerClus;
+    m->data_off = (m->bs->BPB_RsvdSecCnt + m->bs->BPB_NumFATs * m->bs->BPB_FATSz32)
+                  * m->bs->BPB_BytsPerSec;
 }
 
-static void list_root_dir(const char *image_path) {
-    Disk d = disk_open(image_path, 0);
-    uint32_t *fat = fat_table(&d, 0);
-    uint32_t  cluster = d.root_cluster;
-    int       entry_count = 0;
-    int       end_marker_seen = 0;
+static void close_fs(struct fs *m, int rw) {
+    if (rw) msync(m->raw, m->len, MS_SYNC);
+    munmap(m->raw, m->len);
+    close(m->fd);
+}
 
-    while (!end_marker_seen && cluster < FAT_EOC_THRESHOLD) {
-        DirEntry *entries = (DirEntry *)cluster_data(&d, cluster);
+static unsigned char *cdata(struct fs *m, unsigned cl) {
+    return m->raw + m->data_off + (cl - 2) * m->cs;
+}
 
-        for (uint32_t i = 0; i < d.entries_per_cluster; i++) {
-            DirEntry *e = &entries[i];
+static unsigned int *fat(struct fs *m, unsigned which) {
+    unsigned off = (m->bs->BPB_RsvdSecCnt + which * m->bs->BPB_FATSz32)
+                   * m->bs->BPB_BytsPerSec;
+    return (unsigned int *)(m->raw + off);
+}
 
-            if (e->DIR_Name[0] == DIR_ENTRY_END)     { end_marker_seen = 1; break; }
-            if (e->DIR_Name[0] == DIR_ENTRY_DELETED)  continue;
-            if ((e->DIR_Attr & ATTR_LONG_NAME) == ATTR_LONG_NAME) continue;
-            if (e->DIR_Attr & ATTR_VOLUME_ID)         continue;
+/* "FOO.BAR" -> "FOO     BAR" (11 bytes, space padded) */
+static void to83(const char *s, unsigned char buf[11]) {
+    memset(buf, ' ', 11);
+    int j = 0;
+    while (*s && *s != '.' && j < 8) buf[j++] = (unsigned char)*s++;
+    if (*s == '.') {
+        ++s;
+        j = 8;
+        while (*s && j < 11) buf[j++] = (unsigned char)*s++;
+    }
+}
 
-            int is_dir = (e->DIR_Attr & ATTR_DIRECTORY) != 0;
+/* 11-byte "FOO     BAR" -> "FOO.BAR" (or "DIR/" if isdir) */
+static void from83(const unsigned char raw[11], int isdir, char *out) {
+    int n = 8;
+    while (n > 0 && raw[n - 1] == ' ') n--;
+    int o = 0;
+    for (int i = 0; i < n; i++) out[o++] = (char)raw[i];
+    int e = 11;
+    while (e > 8 && raw[e - 1] == ' ') e--;
+    if (e > 8) {
+        out[o++] = '.';
+        for (int i = 8; i < e; i++) out[o++] = (char)raw[i];
+    }
+    if (isdir) out[o++] = '/';
+    out[o] = 0;
+}
 
-            char display[16] = {0};
-            format_short_name(e->DIR_Name, is_dir, display);
+static int hexdig(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
 
-            uint32_t start = ((uint32_t)e->DIR_FstClusHI << 16) | e->DIR_FstClusLO;
-            uint32_t fsize = e->DIR_FileSize;
+static int parse_hash(const char *s, unsigned char out[20]) {
+    for (int i = 0; i < 20; i++) {
+        int hi = hexdig(s[2*i]), lo = hexdig(s[2*i+1]);
+        if (hi < 0 || lo < 0) return 0;
+        out[i] = (unsigned char)((hi << 4) | lo);
+    }
+    return s[40] == '\0';
+}
 
-            if (is_dir) {
-                printf("%s (starting cluster = %u)\n", display, start);
-            } else if (fsize == 0) {
-                printf("%s (size = 0)\n", display);
-            } else {
-                printf("%s (size = %u, starting cluster = %u)\n",
-                       display, fsize, start);
-            }
-            entry_count++;
+/* SHA-1 of `sz` contiguous bytes starting at cluster `start`. */
+static void sha1_contig(struct fs *m, unsigned start, unsigned sz, unsigned char h[20]) {
+    if (sz == 0) SHA1((const unsigned char *)"", 0, h);
+    else         SHA1(cdata(m, start), sz, h);
+}
+
+/* SHA-1 of a possibly-non-contiguous chain. */
+static void sha1_chain(struct fs *m, unsigned *chain, int n, unsigned sz, unsigned char h[20]) {
+    if (n == 0) { SHA1((const unsigned char *)"", 0, h); return; }
+    SHA_CTX c;
+    SHA1_Init(&c);
+    for (int i = 0; i < n; i++) {
+        unsigned take = (i + 1 == n) ? sz - (unsigned)i * m->cs : m->cs;
+        SHA1_Update(&c, cdata(m, chain[i]), take);
+    }
+    SHA1_Final(h, &c);
+}
+
+/* Wire a chain of clusters into all FAT copies. */
+static void wire_chain(struct fs *m, unsigned *chain, int n) {
+    for (unsigned f = 0; f < m->bs->BPB_NumFATs; f++) {
+        unsigned int *t = fat(m, f);
+        for (int i = 0; i < n; i++)
+            t[chain[i]] = (i + 1 == n) ? FATMASK : chain[i + 1];
+    }
+}
+
+/* Wire `n` contiguous clusters starting at `start` (no chain buffer needed). */
+static void wire_contig(struct fs *m, unsigned start, unsigned sz) {
+    unsigned n = (sz + m->cs - 1) / m->cs;
+    for (unsigned f = 0; f < m->bs->BPB_NumFATs; f++) {
+        unsigned int *t = fat(m, f);
+        for (unsigned i = 0; i < n; i++)
+            t[start + i] = (i + 1 == n) ? FATMASK : start + i + 1;
+    }
+}
+
+/* Recursive permutation search for non-contiguous brute force. */
+static int permute(struct fs *m, const unsigned char tgt[20], unsigned sz,
+                   unsigned *chain, int n, int depth,
+                   unsigned *pool, int psz, char *used) {
+    if (depth == n) {
+        unsigned char h[20];
+        sha1_chain(m, chain, n, sz, h);
+        return memcmp(h, tgt, 20) == 0;
+    }
+    for (int i = 0; i < psz; i++) {
+        if (used[i]) continue;
+        used[i]      = 1;
+        chain[depth] = pool[i];
+        if (permute(m, tgt, sz, chain, n, depth + 1, pool, psz, used)) return 1;
+        used[i] = 0;
+    }
+    return 0;
+}
+
+static int try_chain(struct fs *m, DirEntry *e, const unsigned char tgt[20],
+                     unsigned *chain, int *out_n) {
+    unsigned sz    = e->DIR_FileSize;
+    unsigned start = ((unsigned)e->DIR_FstClusHI << 16) | e->DIR_FstClusLO;
+
+    if (sz == 0) {
+        unsigned char h[20];
+        SHA1((const unsigned char *)"", 0, h);
+        *out_n = 0;
+        return memcmp(h, tgt, 20) == 0;
+    }
+
+    int need     = (int)((sz + m->cs - 1) / m->cs);
+    chain[0]     = start;
+    *out_n       = need;
+
+    if (need == 1) {
+        unsigned char h[20];
+        sha1_chain(m, chain, 1, sz, h);
+        return memcmp(h, tgt, 20) == 0;
+    }
+
+    unsigned pool[MAX_POOL];
+    int psz = 0;
+    unsigned int *f0 = fat(m, 0);
+    for (unsigned c = 2; c < 2 + MAX_POOL; c++) {
+        if (c == start) continue;
+        if ((f0[c] & FATMASK) != 0) continue;
+        pool[psz++] = c;
+    }
+    char used[MAX_POOL] = {0};
+    return permute(m, tgt, sz, chain, need, 1, pool, psz, used);
+}
+
+/* ---------- commands ---------- */
+
+static void cmd_info(const char *path) {
+    struct fs m;
+    open_fs(path, 0, &m);
+    printf("Number of FATs = %u\n",                m.bs->BPB_NumFATs);
+    printf("Number of bytes per sector = %u\n",    m.bs->BPB_BytsPerSec);
+    printf("Number of sectors per cluster = %u\n", m.bs->BPB_SecPerClus);
+    printf("Number of reserved sectors = %u\n",    m.bs->BPB_RsvdSecCnt);
+    close_fs(&m, 0);
+}
+
+static void cmd_list(const char *path) {
+    struct fs m;
+    open_fs(path, 0, &m);
+    unsigned cl  = m.bs->BPB_RootClus;
+    unsigned per = m.cs / sizeof(DirEntry);
+    unsigned int *f0 = fat(&m, 0);
+    int n = 0;
+
+    for (;;) {
+        DirEntry *de = (DirEntry *)cdata(&m, cl);
+        int reached_end = 0;
+        for (unsigned i = 0; i < per; i++) {
+            DirEntry *e = de + i;
+            if (e->DIR_Name[0] == 0x00)              { reached_end = 1; break; }
+            if (e->DIR_Name[0] == 0xE5)              continue;
+            if ((e->DIR_Attr & 0x0F) == 0x0F)        continue;
+            if (e->DIR_Attr & 0x08)                  continue;
+
+            int isdir = (e->DIR_Attr & 0x10) != 0;
+            char nm[16];
+            from83(e->DIR_Name, isdir, nm);
+            unsigned start = ((unsigned)e->DIR_FstClusHI << 16) | e->DIR_FstClusLO;
+            unsigned sz    = e->DIR_FileSize;
+            if (isdir)        printf("%s (starting cluster = %u)\n", nm, start);
+            else if (sz == 0) printf("%s (size = 0)\n", nm);
+            else              printf("%s (size = %u, starting cluster = %u)\n", nm, sz, start);
+            n++;
         }
-
-        cluster = fat[cluster] & FAT_ENTRY_MASK;
+        if (reached_end) break;
+        cl = f0[cl] & FATMASK;
+        if (cl >= EOC) break;
     }
 
-    printf("Total number of entries = %d\n", entry_count);
-    disk_close(&d);
+    printf("Total number of entries = %d\n", n);
+    close_fs(&m, 0);
 }
 
-static void recover_contiguous_file(const char *image_path,
-                                    const char *target_name,
-                                    const char *sha1_hex) {
-    Disk d = disk_open(image_path, 1);
+static void cmd_recover(const char *path, const char *name, const char *sha_hex) {
+    struct fs m;
+    open_fs(path, 1, &m);
 
-    uint8_t target_short[11];
-    name_to_short(target_name, target_short);
+    unsigned char tgt[11];
+    to83(name, tgt);
 
-    uint8_t  target_sha1[SHA1_BYTES];
-    uint8_t *sha1_filter = NULL;
-    if (sha1_hex && parse_sha1_hex(sha1_hex, target_sha1)) {
-        sha1_filter = target_sha1;
+    unsigned char sha[20];
+    int has_sha = (sha_hex && parse_hash(sha_hex, sha));
+
+    DirEntry *hit = NULL;
+    int matches = 0;
+
+    unsigned cl  = m.bs->BPB_RootClus;
+    unsigned per = m.cs / sizeof(DirEntry);
+    unsigned int *f0 = fat(&m, 0);
+
+    for (;;) {
+        DirEntry *de = (DirEntry *)cdata(&m, cl);
+        int reached_end = 0;
+        for (unsigned i = 0; i < per; i++) {
+            DirEntry *e = de + i;
+            if (e->DIR_Name[0] == 0x00)               { reached_end = 1; break; }
+            if (e->DIR_Name[0] != 0xE5)               continue;
+            if ((e->DIR_Attr & 0x0F) == 0x0F)         continue;
+            if (e->DIR_Attr & 0x10)                   continue;
+            if (e->DIR_Attr & 0x08)                   continue;
+            if (memcmp(e->DIR_Name + 1, tgt + 1, 10)) continue;
+
+            if (has_sha) {
+                unsigned start = ((unsigned)e->DIR_FstClusHI << 16) | e->DIR_FstClusLO;
+                unsigned char h[20];
+                sha1_contig(&m, start, e->DIR_FileSize, h);
+                if (memcmp(h, sha, 20)) continue;
+            }
+            if (!hit) hit = e;
+            matches++;
+        }
+        if (reached_end) break;
+        cl = f0[cl] & FATMASK;
+        if (cl >= EOC) break;
     }
 
-    DirEntry *match = NULL;
-    int match_count = find_deleted_matches(&d, target_short, sha1_filter, &match);
-
-    if (match_count == 0) {
-        printf("%s: file not found\n", target_name);
-        disk_close(&d);
-        return;
-    }
-    if (!sha1_filter && match_count > 1) {
-        printf("%s: multiple candidates found\n", target_name);
-        disk_close(&d);
-        return;
-    }
-
-    match->DIR_Name[0] = target_short[0];
-    uint32_t start = ((uint32_t)match->DIR_FstClusHI << 16) | match->DIR_FstClusLO;
-    write_contiguous_chain(&d, start, match->DIR_FileSize);
-
-    disk_close(&d);
-
-    if (sha1_filter) {
-        printf("%s: successfully recovered with SHA-1\n", target_name);
+    if (matches == 0) {
+        printf("%s: file not found\n", name);
+    } else if (!has_sha && matches > 1) {
+        printf("%s: multiple candidates found\n", name);
     } else {
-        printf("%s: successfully recovered\n", target_name);
+        hit->DIR_Name[0] = tgt[0];
+        unsigned start = ((unsigned)hit->DIR_FstClusHI << 16) | hit->DIR_FstClusLO;
+        wire_contig(&m, start, hit->DIR_FileSize);
+        printf("%s: %s\n", name,
+               has_sha ? "successfully recovered with SHA-1"
+                       : "successfully recovered");
     }
+    close_fs(&m, 1);
+}
+
+static void cmd_recover_any(const char *path, const char *name, const char *sha_hex) {
+    struct fs m;
+    open_fs(path, 1, &m);
+
+    unsigned char tgt[11];
+    to83(name, tgt);
+
+    unsigned char sha[20];
+    if (!parse_hash(sha_hex, sha)) {
+        printf("%s: file not found\n", name);
+        close_fs(&m, 1);
+        return;
+    }
+
+    DirEntry *winner = NULL;
+    unsigned chain[MAX_CHAIN];
+    int chain_n = 0;
+
+    unsigned cl  = m.bs->BPB_RootClus;
+    unsigned per = m.cs / sizeof(DirEntry);
+    unsigned int *f0 = fat(&m, 0);
+
+    while (!winner) {
+        DirEntry *de = (DirEntry *)cdata(&m, cl);
+        int reached_end = 0;
+        for (unsigned i = 0; i < per && !winner; i++) {
+            DirEntry *e = de + i;
+            if (e->DIR_Name[0] == 0x00)               { reached_end = 1; break; }
+            if (e->DIR_Name[0] != 0xE5)               continue;
+            if ((e->DIR_Attr & 0x0F) == 0x0F)         continue;
+            if (e->DIR_Attr & 0x10)                   continue;
+            if (e->DIR_Attr & 0x08)                   continue;
+            if (memcmp(e->DIR_Name + 1, tgt + 1, 10)) continue;
+
+            unsigned ch[MAX_CHAIN];
+            int n;
+            if (try_chain(&m, e, sha, ch, &n)) {
+                winner  = e;
+                chain_n = n;
+                memcpy(chain, ch, sizeof(unsigned) * (size_t)n);
+            }
+        }
+        if (reached_end || winner) break;
+        cl = f0[cl] & FATMASK;
+        if (cl >= EOC) break;
+    }
+
+    if (!winner) {
+        printf("%s: file not found\n", name);
+    } else {
+        winner->DIR_Name[0] = tgt[0];
+        if (chain_n > 0) wire_chain(&m, chain, chain_n);
+        printf("%s: successfully recovered with SHA-1\n", name);
+    }
+    close_fs(&m, 1);
 }
 
 int main(int argc, char *argv[]) {
-    const char *prog_name = argv[0];
+    const char *prog = argv[0];
+    if (argc < 3) { usage(prog); return 1; }
 
-    if (argc < 3) {
-        print_usage(prog_name);
-        return 1;
-    }
-
-    int   info_flag       = 0;
-    int   list_flag       = 0;
-    char *recover_arg     = NULL;
-    char *recover_any_arg = NULL;
-    char *sha1_arg        = NULL;
+    int   wantI = 0, wantL = 0;
+    char *fname = NULL, *Fname = NULL, *sha = NULL;
 
     opterr = 0;
     optind = 1;
-
-    int opt;
-    while ((opt = getopt(argc - 1, argv + 1, ":ilr:R:s:")) != -1) {
-        switch (opt) {
-            case 'i': info_flag       = 1;      break;
-            case 'l': list_flag       = 1;      break;
-            case 'r': recover_arg     = optarg; break;
-            case 'R': recover_any_arg = optarg; break;
-            case 's': sha1_arg        = optarg; break;
-            default:
-                print_usage(prog_name);
-                return 1;
+    int c;
+    while ((c = getopt(argc - 1, argv + 1, ":ilr:R:s:")) != -1) {
+        switch (c) {
+            case 'i': wantI = 1;       break;
+            case 'l': wantL = 1;       break;
+            case 'r': fname = optarg;  break;
+            case 'R': Fname = optarg;  break;
+            case 's': sha   = optarg;  break;
+            default : usage(prog); return 1;
         }
     }
 
-    if (optind != argc - 1) {
-        print_usage(prog_name);
-        return 1;
-    }
+    if (optind != argc - 1)                  { usage(prog); return 1; }
+    int modes = wantI + wantL + (fname != NULL) + (Fname != NULL);
+    if (modes != 1)                          { usage(prog); return 1; }
+    if ((wantI || wantL) && sha)             { usage(prog); return 1; }
+    if (Fname && !sha)                       { usage(prog); return 1; }
 
-    int chosen_modes = info_flag
-                     + list_flag
-                     + (recover_arg     != NULL)
-                     + (recover_any_arg != NULL);
-    if (chosen_modes != 1) {
-        print_usage(prog_name);
-        return 1;
-    }
-
-    if ((info_flag || list_flag) && sha1_arg != NULL) {
-        print_usage(prog_name);
-        return 1;
-    }
-
-    if (recover_any_arg != NULL && sha1_arg == NULL) {
-        print_usage(prog_name);
-        return 1;
-    }
-
-    if (info_flag) {
-        print_fs_info(argv[1]);
-    } else if (list_flag) {
-        list_root_dir(argv[1]);
-    } else if (recover_arg) {
-        recover_contiguous_file(argv[1], recover_arg, sha1_arg);
-    }
+    if      (wantI) cmd_info(argv[1]);
+    else if (wantL) cmd_list(argv[1]);
+    else if (fname) cmd_recover(argv[1], fname, sha);
+    else            cmd_recover_any(argv[1], Fname, sha);
 
     return 0;
 }
